@@ -1,0 +1,49 @@
+# Unity
+unity-client/Library/
+unity-client/Temp/
+unity-client/Logs/
+unity-client/obj/
+unity-client/Build/
+unity-client/Builds/
+unity-client/.DS_Store
+unity-client/*.csproj
+unity-client/*.sln
+unity-client/*.unityproj
+unity-client/UserSettings/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.env
+.venv
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Models (too large for git — tracked via docs/model-registry.md)
+backend/models/
+*.gguf
+*.bin
+*.onnx
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+
+# Secrets
+.env
+.env.local
+config/secrets.yaml
