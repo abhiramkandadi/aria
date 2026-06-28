@@ -1,120 +1,177 @@
 """
-ARIA Stage 3 — End-to-End Test
-Connects to the live bridge server and sends:
-  1. Handshake
-  2. Text-only request
-  3. Frame + text request (vision)
-Measures and prints hot latency for each phase.
-Does NOT reload the model — server stays hot between requests.
+ARIA Stage 3 — Qwen2.5-Omni-3B Inference Module
+Wraps thinker-only vision+language inference.
+
+Usage:
+    from backend.inference.omni import OmniInference
+    omni = OmniInference()
+    omni.load()
+    text, latency = omni.run("What do you see?", image=pil_image)
+
+Notes:
+    - Uses 4-bit NF4 quantization (bitsandbytes) to fit in 8GB VRAM
+    - model.thinker.generate() only — native Talker audio disabled
+      (broken in transformers 5.x on Windows, see Stage 3 handoff)
+    - device_map="auto" splits across GPU+CPU as needed
+    - RTX 5060 sm_120: requires torch 2.7.0+cu128
 """
 
-import asyncio
-import base64
-import json
 import time
-import wave
-import io
-import numpy as np
-import sounddevice as sd
-import websockets
+import warnings
+warnings.filterwarnings("ignore")
+
+import torch
 from PIL import Image
+from transformers import (
+    BitsAndBytesConfig,
+    Qwen2_5OmniForConditionalGeneration,
+    Qwen2_5OmniProcessor,
+)
 
-SERVER_URI  = "ws://192.168.1.99:8765"
-IMAGE_PATH  = "scripts/test_image.jpg"
+MODEL_PATH     = "C:/Users/abhir/aria/models/qwen2.5-omni-3b"
+MAX_NEW_TOKENS = 128
 
-def load_image_as_b64(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+SYSTEM_PROMPT = (
+    "You are ARIA, a spatially-aware AI assistant running on a Meta Quest 3. "
+    "You can see the user's environment through the camera. "
+    "Be concise — 1 to 2 sentences max. No markdown, no bullet points."
+)
 
-def play_wav_bytes(wav_bytes: bytes):
-    try:
-        buf = io.BytesIO(wav_bytes)
-        with wave.open(buf, "rb") as wf:
-            sample_rate = wf.getframerate()
-            frames      = wf.readframes(wf.getnframes())
-            audio       = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-        sd.play(audio, sample_rate)
-        sd.wait()
-    except Exception as e:
-        print(f"    [audio playback error: {e}]")
 
-async def run_test():
-    print("=" * 60)
-    print("ARIA Stage 3 — End-to-End Test")
-    print(f"Server: {SERVER_URI}")
-    print("=" * 60)
+class OmniInference:
+    """
+    Singleton-pattern wrapper for Qwen2.5-Omni-3B thinker inference.
+    Load once at server startup, reuse for all requests.
+    """
 
-    frame_b64 = load_image_as_b64(IMAGE_PATH)
+    def __init__(self, model_path: str = MODEL_PATH):
+        self.model_path  = model_path
+        self.processor   = None
+        self.model       = None
+        self._loaded     = False
+        self.load_time_s = 0.0
+        self.vram_gb     = 0.0
 
-    async with websockets.connect(SERVER_URI) as ws:
+    def load(self) -> None:
+        """Load model and processor. Call once at startup."""
+        if self._loaded:
+            return
 
-        # ── Phase 1: Handshake ────────────────────────────────────────
-        print("\n[Phase 1] Handshake...")
         t0 = time.perf_counter()
-        await ws.send(json.dumps({"type": "handshake"}))
-        raw = await ws.recv()
-        handshake_time = time.perf_counter() - t0
-        ack = json.loads(raw)
-        print(f"    Server:        {ack.get('server')}")
-        print(f"    Model:         {ack.get('model')}")
-        print(f"    VRAM:          {ack.get('vram_gb')}GB")
-        print(f"    Model load:    {ack.get('model_load_s')}s (cold start)")
-        print(f"    Handshake RTT: {handshake_time*1000:.0f}ms")
 
-        # ── Phase 2: Text-only (hot) ──────────────────────────────────
-        print("\n[Phase 2] Text-only request (hot)...")
+        self.processor = Qwen2_5OmniProcessor.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+        )
+
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+
+        self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+            self.model_path,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        self.model.eval()
+
+        self.load_time_s = time.perf_counter() - t0
+        if torch.cuda.is_available():
+            self.vram_gb = torch.cuda.memory_allocated(0) / 1e9
+
+        self._loaded = True
+
+    def run(
+        self,
+        text: str,
+        image: Image.Image = None,
+        max_new_tokens: int = MAX_NEW_TOKENS,
+    ) -> tuple[str, dict]:
+        """
+        Run inference. Returns (response_text, latency_dict).
+
+        Args:
+            text:           User query string.
+            image:          Optional PIL Image from Quest camera frame.
+            max_new_tokens: Max tokens to generate.
+
+        Returns:
+            response_text:  Model response string.
+            latency:        Dict with preprocess_s, inference_s, total_s.
+        """
+        if not self._loaded:
+            raise RuntimeError("OmniInference.load() must be called before run()")
+
         t0 = time.perf_counter()
-        await ws.send(json.dumps({
-            "type":    "text",
-            "content": "Hello ARIA, what can you do?",
-        }))
 
-        # Receive JSON metadata
-        raw_meta = await ws.recv()
-        meta     = json.loads(raw_meta)
-        # Receive WAV audio
-        wav_bytes = await ws.recv()
-        text_total = time.perf_counter() - t0
+        if image is not None:
+            content = [
+                {"type": "image", "image": image},
+                {"type": "text",  "text": f"{SYSTEM_PROMPT}\n\n{text}"},
+            ]
+            images = [image]
+        else:
+            content = [{"type": "text", "text": f"{SYSTEM_PROMPT}\n\n{text}"}]
+            images  = None
 
-        print(f"    Response:      {meta.get('text')}")
-        lat = meta.get("latency", {})
-        print(f"    Inference:     {lat.get('inference_s')}s")
-        print(f"    TTS:           {lat.get('tts_s')}s")
-        print(f"    HOT LATENCY:   {text_total:.2f}s (wall clock)")
-        print("    Playing audio...")
-        play_wav_bytes(wav_bytes)
+        messages  = [{"role": "user", "content": content}]
+        chat_text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
-        # ── Phase 3: Vision (frame + text, hot) ──────────────────────
-        print("\n[Phase 3] Vision request — frame + text (hot)...")
-        t0 = time.perf_counter()
-        await ws.send(json.dumps({
-            "type":      "frame_text",
-            "content":   "What do you see in front of me? Be brief.",
-            "frame_b64": frame_b64,
-        }))
+        if images:
+            inputs = self.processor(
+                text=[chat_text], images=images, return_tensors="pt"
+            )
+        else:
+            inputs = self.processor(
+                text=[chat_text], return_tensors="pt"
+            )
 
-        raw_meta  = await ws.recv()
-        meta      = json.loads(raw_meta)
-        wav_bytes = await ws.recv()
-        vision_total = time.perf_counter() - t0
+        inputs = {
+            k: v.to("cuda") if hasattr(v, "to") else v
+            for k, v in inputs.items()
+        }
 
-        print(f"    Response:      {meta.get('text')}")
-        lat = meta.get("latency", {})
-        print(f"    Inference:     {lat.get('inference_s')}s")
-        print(f"    TTS:           {lat.get('tts_s')}s")
-        print(f"    HOT LATENCY:   {vision_total:.2f}s (wall clock)")
-        print("    Playing audio...")
-        play_wav_bytes(wav_bytes)
+        t_preprocess = time.perf_counter() - t0
 
-        # ── Summary ───────────────────────────────────────────────────
-        print("\n" + "=" * 60)
-        print("STAGE 3 LATENCY SUMMARY")
-        print("=" * 60)
-        print(f"  Cold start (model load):     {ack.get('model_load_s')}s")
-        print(f"  Phase 1 — Handshake RTT:     {handshake_time*1000:.0f}ms")
-        print(f"  Phase 2 — Text hot latency:  {text_total:.2f}s")
-        print(f"  Phase 3 — Vision hot latency:{vision_total:.2f}s")
-        print("=" * 60)
-        print("Stage 3 COMPLETE")
+        t1 = time.perf_counter()
+        with torch.no_grad():
+            output_ids = self.model.thinker.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+        t_inference = time.perf_counter() - t1
 
-asyncio.run(run_test())
+        input_len = inputs["input_ids"].shape[1]
+        generated = output_ids[0][input_len:]
+        response  = self.processor.decode(
+            generated, skip_special_tokens=True
+        ).strip()
+
+        latency = {
+            "preprocess_s": round(t_preprocess, 3),
+            "inference_s":  round(t_inference,  3),
+            "total_s":      round(time.perf_counter() - t0, 3),
+        }
+        return response, latency
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    @property
+    def status(self) -> dict:
+        return {
+            "loaded":      self._loaded,
+            "model_path":  self.model_path,
+            "load_time_s": round(self.load_time_s, 1),
+            "vram_gb":     round(self.vram_gb, 2),
+        }

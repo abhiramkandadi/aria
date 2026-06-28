@@ -47,3 +47,14 @@ Thumbs.db
 .env
 .env.local
 config/secrets.yaml
+
+# Large model files
+models/
+backend/tts/voices/
+
+# Test artifacts
+scripts/test_image.jpg
+
+# Python cache
+__pycache__/
+*.pyc
